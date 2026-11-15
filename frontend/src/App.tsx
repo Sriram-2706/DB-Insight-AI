@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Bar, BarChart, CartesianGrid, Cell, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { ArrowDownToLine, ArrowRight, BarChart3, Check, ChevronDown, ChevronRight, CircleHelp, Database as DatabaseIcon, FileUp, HardDrive, LayoutDashboard, LockKeyhole, MessageSquareText, Plus, Search, ShieldCheck, Sparkles, Table2, Upload, X } from 'lucide-react'
-import type { Database, SqlJsStatic } from 'sql.js'
+import type { Database } from 'sql.js'
 import { createSample, getEngine, inspect, runQuery, type QueryData, type Schema, type TableInfo } from './db'
-import { describeResult, generate, type Answer } from './query'
+import { askGemini, type Answer } from './query'
 
 const suggestions = [
   { label: 'Top 5 customers by spend', question: 'Who are the top 5 customers by total purchase amount?' },
@@ -18,12 +18,13 @@ const format = (v: unknown) => typeof v === 'number' ? new Intl.NumberFormat('en
 
 export default function App() {
   const [db, setDb] = useState<Database | null>(null)
-  const [SQL, setSQL] = useState<SqlJsStatic | null>(null)
   const [schema, setSchema] = useState<Schema>([])
   const [dbName, setDbName] = useState('Sample commerce data')
   const [sample, setSample] = useState(true)
   const [loading, setLoading] = useState(false)
+  const [asking, setAsking] = useState(false)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState<Answer | null>(null)
   const [result, setResult] = useState<QueryData | null>(null)
@@ -39,7 +40,6 @@ export default function App() {
     setLoading(true); setError('')
     try {
       const Engine = await getEngine()
-      setSQL(Engine)
       let next: Database
       let name: string
       let isSample: boolean
@@ -53,10 +53,11 @@ export default function App() {
       }
       const nextSchema = inspect(next)
       if (!nextSchema.some(t => t.type === 'table')) { next.close(); throw new Error('This file does not contain any readable SQLite tables.') }
+      next.run('PRAGMA query_only = ON')
       db?.close()
       setDb(next); setSchema(nextSchema); schemaRef.current = nextSchema; setDbName(name); setSample(isSample)
       setSelected(nextSchema.find(t => t.type === 'table')?.name ?? '')
-      setAnswer(null); setResult(null); setQuestion(''); setError('')
+      setAnswer(null); setResult(null); setQuestion(''); setError(''); setNotice('')
     } catch (e) { setError(e instanceof Error ? e.message : 'Could not open this SQLite database.') }
     finally { setLoading(false) }
   }, [db])
@@ -64,15 +65,22 @@ export default function App() {
   useEffect(() => { void load(); return () => { db?.close() } }, []) // load the in-browser demo once
   useEffect(() => { schemaRef.current = schema }, [schema])
 
-  const run = (value = question) => {
-    if (!db || !value.trim()) return
-    setError('')
+  const run = async (value = question) => {
+    if (!db || !value.trim() || asking) return
+    setError(''); setNotice(''); setResult(null); setAnswer(null); setQuestion(value); setAsking(true)
     try {
-      const built = generate(value, schemaRef.current)
+      const built = await askGemini(value, schemaRef.current)
+      setAnswer(built)
+      if (built.needsClarification || !built.sql.trim()) {
+        setNotice([built.explanation, built.clarificationQuestion].filter(Boolean).join(' '))
+        setActiveNav('explore')
+        return
+      }
       const data = runQuery(db, built.sql)
-      setQuestion(value); setAnswer(built); setResult(data)
+      setResult(data)
       setActiveNav('explore')
-    } catch (e) { setError(e instanceof Error ? e.message : 'I could not answer that question safely.') }
+    } catch (e) { setError(e instanceof Error ? e.message : 'The query could not be generated or safely executed.') }
+    finally { setAsking(false) }
   }
 
   const totals = useMemo(() => ({ tables: schema.filter(t => t.type === 'table').length, rows: schema.reduce((n,t)=>n+(t.count ?? 0),0), columns: schema.reduce((n,t)=>n+t.columns.length,0), sizeLabel: sample ? 'Built in' : 'Local file' }), [schema, sample])
@@ -109,7 +117,7 @@ export default function App() {
       <header className="topbar"><div className="crumb"><span>Workspace</span><ChevronRight size={14}/><b>{activeNav==='overview'?'Database overview':'Explore'}</b></div><div className="top-actions"><span className="local-chip"><ShieldCheck size={14}/> Browser only</span><button className="button secondary small" onClick={pickFile}><Upload size={15}/> Open database</button><input ref={fileRef} type="file" accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3" hidden onChange={e=>{onFiles(e.target.files);e.currentTarget.value=''}}/></div></header>
       <div className="content-wrap">
         {loading && <div className="loading-bar"><span/></div>}
-        {error && <div className="error-banner"><CircleHelp size={16}/><span>{error}</span><button onClick={()=>setError('')}><X size={15}/></button></div>}
+        {error && <div className="error-banner"><CircleHelp size={16}/><span>{error}</span>{question&&<button className="retry-query" onClick={()=>void run(question)} disabled={asking}>Retry</button>}<button onClick={()=>setError('')} title="Dismiss"><X size={15}/></button></div>}
         {activeNav==='overview' ? <section className="overview-page">
           <div className="eyebrow">DATABASE OVERVIEW <span>·</span> {sample?'DEMO DATA': 'LOCAL FILE'}</div>
           <div className="page-title-row"><div><h1>Know what’s<br className="mobile-break"/> inside your data.</h1><p className="page-subtitle">A clear view of the structure behind <b>{dbName}</b>.</p></div><button className="button secondary" onClick={()=>setActiveNav('explore')}><MessageSquareText size={16}/> Ask a question</button></div>
@@ -119,21 +127,22 @@ export default function App() {
               {(selected===t.name || schema.length===1) && <div className="column-list"><div className="column-heading"><span>FIELD</span><span>TYPE</span><span>KEY</span></div>{t.columns.map(c=><div className="column-row" key={c.name}><span className="column-name">{c.name}</span><code>{c.type.toUpperCase()||'—'}</code><span>{c.pk?<i className="key-tag">PK</i>:t.relations.find(r=>r.from===c.name)?<i className="key-tag fk">FK</i>:''}</span></div>)}{t.relations.map((r,i)=><div className="relation-note" key={i}>↳ {r.from} references {r.toTable}.{r.to}</div>)}</div>}
             </div>)}
           </div><div className="panel numeric-panel"><div className="panel-head"><div><div className="section-kicker">FIELD PROFILE</div><h2>{activeTable?.name ?? 'Select a table'}</h2></div></div>{activeTable ? <>{numericSummary.length ? <div className="numeric-list"><div className="numeric-heading"><span>NUMERIC FIELD</span><span>AVERAGE</span><span>RANGE</span></div>{numericSummary.map(n=><div key={n.name} className="numeric-row"><b>{n.name}</b><span>{format(n.avg)}</span><small>{format(n.min)} — {format(n.max)}</small></div>)}</div>:<div className="empty-note">No numeric fields in this table.</div>}<div className="profile-foot"><span>NULL CHECK</span><button onClick={()=>run('Find missing values')}>Inspect missing values <ArrowRight size={14}/></button></div></>:<div className="empty-note">Choose a table to see a profile.</div>}</div></div>
-          <div className="privacy-note"><ShieldCheck size={16}/><div><b>Local by default</b><span>The database is loaded into browser memory. No upload endpoint or remote database service is involved.</span></div></div>
+          <div className="privacy-note"><ShieldCheck size={16}/><div><b>Local database processing</b><span>The file and its rows stay in browser memory. Only your question and schema metadata are sent to Gemini when you ask.</span></div></div>
         </section> : <section className="explore-page">
           <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line"/> PRIVATE DATA EXPLORATION <span className="eyebrow-dot">·</span> {sample?'SAMPLE DATABASE':'LOCAL DATABASE'}</div><h1>Make sense of<br/><em>what’s in your data.</em></h1><p className="intro">Ask a question in plain language. Get a transparent SQL query and a useful answer, all on your device.</p></div><div className="welcome-graphic" aria-hidden="true"><div className="graphic-ring ring-one"/><div className="graphic-ring ring-two"/><div className="graphic-core"><DatabaseIcon size={24}/></div><span className="graphic-orbit orbit-a"/><span className="graphic-orbit orbit-b"/><span className="graphic-orbit orbit-c"/></div></div>
           <div className="stat-strip"><div><span className="stat-label">DATABASE</span><b title={dbName}>{dbName}</b></div><div><span className="stat-label">TABLES</span><b>{totals.tables}</b></div><div><span className="stat-label">RECORDS</span><b>{totals.rows.toLocaleString()}</b></div><div><span className="stat-label">PROCESSING</span><b className="safe-value"><i/> In browser</b></div><button title="Open another SQLite database" className="swap-db" onClick={pickFile}><ArrowDownToLine size={16}/></button></div>
-          <div className="query-composer"><div className="composer-top"><div className="composer-icon"><Sparkles size={16}/></div><div><b>Ask your data</b><span>Describe what you’d like to find</span></div><div className="engine-label"><span/> DEMO QUERY ENGINE</div></div><div className="input-wrap"><textarea ref={inputRef} value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();run()}}} placeholder="e.g. Who are my top 5 customers by spend?" rows={2}/><button className="ask-button" onClick={()=>run()} disabled={!question.trim()||loading}>Explore <ArrowRight size={16}/></button></div><div className="composer-foot"><span><LockKeyhole size={12}/> Queries run against the database in your browser</span><kbd>ENTER ↵</kbd></div></div>
+          <div className="query-composer"><div className="composer-top"><div className="composer-icon"><Sparkles size={16}/></div><div><b>Ask your data</b><span>Describe what you’d like to find</span></div><div className="engine-label"><span/> GEMINI · SCHEMA-AWARE</div></div><div className="input-wrap"><textarea ref={inputRef} value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();void run()}}} placeholder="Ask a question about the loaded database…" rows={2}/><button className="ask-button" onClick={()=>void run()} disabled={!question.trim()||loading||asking}>{asking?'Thinking…':'Explore'} {!asking&&<ArrowRight size={16}/>}</button></div><div className="composer-foot"><span><LockKeyhole size={12}/> Only your question and schema metadata are sent to Gemini</span><kbd>ENTER ↵</kbd></div></div>
           {!result && <div className="suggestions-block"><div className="suggestion-title"><span>START WITH A QUESTION</span><span className="suggestion-rule"/></div><div className="suggestion-grid">{suggestions.map((s,i)=><button key={s.label} className="suggestion" onClick={()=>run(s.question)}><span className="suggestion-num">0{i+1}</span><span>{s.label}</span><ArrowRight size={14}/></button>)}</div></div>}
-          {result && answer && <div className="result-panel"><div className="result-top"><div><div className="section-kicker">QUERY RESULT <span>·</span> {result.rows.length.toLocaleString()} ROWS</div><h2>{answer.title}</h2></div><button className="icon-button" onClick={()=>{setResult(null);setAnswer(null)}} title="Clear result"><X size={17}/></button></div><p className="result-explanation">{describeResult(result,answer)}</p>
+          {notice && answer && <div className="result-panel"><div className="result-top"><div><div className="section-kicker">CLARIFICATION</div><h2>{answer.title}</h2></div><button className="icon-button" onClick={()=>{setNotice('');setAnswer(null)}} title="Clear message"><X size={17}/></button></div><p className="result-explanation clarification-text">{notice}</p></div>}
+          {result && answer && <div className="result-panel"><div className="result-top"><div><div className="section-kicker">QUERY RESULT <span>·</span> {result.rows.length.toLocaleString()} ROWS</div><h2>{answer.title}</h2></div><button className="icon-button" onClick={()=>{setResult(null);setAnswer(null)}} title="Clear result"><X size={17}/></button></div><p className="result-explanation">{answer.explanation}{result.rows.length ? ` Showing ${result.rows.length.toLocaleString()} ${result.rows.length===1?'row':'rows'}.` : ' The query returned no matching rows.'}</p>
             {chartable && <div className="chart-area"><div className="chart-header"><b>{answer.title}</b><span>{chartType==='line'?'MONTHLY TREND':'COMPARISON'}</span></div><ResponsiveContainer width="100%" height={240}>{chartType==='line' ? <LineChart data={result.rows} margin={{top:12,right:16,bottom:0,left:0}}><CartesianGrid stroke="#29312d" vertical={false}/><XAxis dataKey={result.columns[0]} tick={{fill:'#818a83',fontSize:11}} axisLine={false} tickLine={false}/><YAxis tick={{fill:'#818a83',fontSize:11}} axisLine={false} tickLine={false} width={55}/><Tooltip contentStyle={{background:'#1a211d',border:'1px solid #343d37',borderRadius:6,color:'#f2f2e9'}}/><Line type="monotone" dataKey={result.columns[1]} stroke="#c8f36a" strokeWidth={2.4} dot={{r:3,fill:'#c8f36a',stroke:'#151b17',strokeWidth:2}} activeDot={{r:5}}/></LineChart> : <BarChart data={result.rows} margin={{top:8,right:14,bottom:0,left:0}}><CartesianGrid stroke="#29312d" vertical={false}/><XAxis dataKey={result.columns[0]} tick={{fill:'#818a83',fontSize:11}} axisLine={false} tickLine={false}/><YAxis tick={{fill:'#818a83',fontSize:11}} axisLine={false} tickLine={false} width={55}/><Tooltip contentStyle={{background:'#1a211d',border:'1px solid #343d37',borderRadius:6,color:'#f2f2e9'}}/><Bar dataKey={result.columns[1]} radius={[3,3,0,0]}>{result.rows.map((_,i)=><Cell key={i} fill={colors[i%colors.length]}/>)}</Bar></BarChart>}</ResponsiveContainer></div>}
             <div className="result-table-wrap"><table className="result-table"><thead><tr>{result.columns.map(c=><th key={c}>{c}</th>)}</tr></thead><tbody>{result.rows.slice(0,50).map((row,i)=><tr key={i}>{result.columns.map(c=><td key={c}>{format(row[c])}</td>)}</tr>)}</tbody></table>{result.rows.length>50&&<div className="table-more">Showing first 50 of {result.rows.length} rows</div>}</div>
             <details className="sql-details"><summary><code>SQL</code><span>View generated query</span><ChevronDown size={14}/></summary><pre>{answer.sql}</pre></details>
           </div>}
-          <div className="disclaimer"><div className="disclaimer-icon"><Sparkles size={14}/></div><span><b>Local demo query engine</b> · Rule-based SQL generation, not an LLM. Unsupported questions are explained instead of guessed.</span><button title="About this engine"><CircleHelp size={15}/></button></div>
+          <div className="disclaimer"><div className="disclaimer-icon"><Sparkles size={14}/></div><span><b>Gemini schema-aware SQL</b> · Gemini receives the question and schema metadata only. The generated query is validated, then executed against the local database.</span><button title="About this engine"><CircleHelp size={15}/></button></div>
         </section>}
       </div>
-      <footer className="bottomline"><span>DB / INSIGHT</span><span>YOUR DATA STAYS YOURS <i/> NO CLOUD UPLOAD</span></footer>
+      <footer className="bottomline"><span>DB / INSIGHT</span><span>DATABASE STAYS LOCAL <i/> NO ROWS SENT</span></footer>
     </main>
   </div>
 }

@@ -1,33 +1,71 @@
 # DB Insight AI
 
-A local-first SQLite explorer for people who want to ask practical questions of a database without writing SQL. The React + Vite frontend loads and queries `.db`, `.sqlite`, and `.sqlite3` files inside the browser with `sql.js` (SQLite compiled to WebAssembly). Uploaded files are never sent to an application server. The Python files under `backend/` are preserved experiments and are not part of this app's runtime.
+DB Insight turns natural-language questions into SQLite queries using Gemini, while keeping the uploaded database in the browser. The browser sends only the question and inspected schema metadata to the API. It never sends database files or row contents. Generated SQL is checked by the API against the supplied schema, checked again by SQLite in query-only mode, and then run locally in `sql.js`.
+
+The project keeps the React/Vite app in `frontend/` and adds a FastAPI service in `backend/`. The existing `backend/llm_engine.py`, `backend/database_inspector.py`, and `backend/venv/` are preserved experimental work; the new API does not depend on the Ollama experiment.
 
 ## Repository structure
 
 ```text
 DB-Insight-AI/
-├── backend/                 # Preserved Python experiments and virtual environment
-├── frontend/                # Standalone Vite application and deployment config
-│   ├── src/                 # React UI, local SQLite engine, and query logic
-│   ├── index.html
+├── backend/
+│   ├── main.py                  # FastAPI, Gemini generation, schema/SQL validation
+│   ├── requirements.txt
+│   ├── tests/                   # Validator, API, and optional Gemini tests
+│   └── llm_engine.py            # Preserved experiment
+├── frontend/
+│   ├── src/                     # React app, sql.js, and query presentation
 │   ├── package.json
-│   ├── tsconfig.json
-│   ├── vercel.json
-│   └── vite.config.ts
-├── .gitignore
+│   └── vite.config.ts            # Local /api proxy
+├── .env.example
+├── vercel.json                  # One-project Vercel Services routing
 └── README.md
 ```
 
-## Run locally
+## Local development (PowerShell)
 
-From `frontend/`, install dependencies with `npm install`, then use `npm run dev`. `npm run build` creates the static site in `frontend/dist/`. The Vercel configuration is scoped to the frontend; the app does not need the Python backend or environment variables.
+Create a root `.env` by copying `.env.example` and set `GEMINI_API_KEY` to a key from Google AI Studio. `GEMINI_MODEL` is optional and defaults to `gemini-3.5-flash-lite`.
 
-## Vercel settings
+In one terminal:
 
-Set **Root Directory** to `frontend` and use the Vite framework preset. Set **Build Command** to `npm run build` and **Output Directory** to `dist`. No install command override, environment variables, or backend service are required.
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+uvicorn backend.main:app --reload --port 8000
+```
 
-## Query behavior
+In another terminal:
 
-The clearly labeled local demo query engine uses database table and column metadata to build a limited set of read-only `SELECT` queries. It supports table record counts, total sales/revenue, top customers, product sales, monthly sales trends, category comparisons, and NULL checks where the schema provides the needed fields and relationships. Every generated query is shown beside the result. The engine is deterministic rule-based logic, not an LLM. For unsupported or ambiguous requests it explains what it could not identify rather than sending a guessed query.
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
 
-The demo database is built in memory at startup and includes customers, products, orders, and order items. Uploaded databases are held in browser memory and are limited to 50 MB. Query results are capped at 200 rows; the results view displays at most 50 rows at once. Schema inference uses declared foreign keys first and conventional key names as a fallback. Complex schemas, unusual naming, date formats other than SQLite-recognized values, and nuanced business definitions may need manual SQL or a future query-engine extension. Numeric field profiles currently cover the selected table.
+Vite proxies `/api` to FastAPI on `127.0.0.1:8000`. For a health check, open `http://127.0.0.1:8000/api/health`.
+
+## Vercel deployment
+
+This repository uses Vercel Services to build the frontend and Python API in one Vercel project with same-origin routing. Services are currently a Vercel beta feature; select **Services** as the project's Framework Preset.
+
+| Setting | Value |
+| --- | --- |
+| Root Directory | Repository root (`.`) |
+| Framework Preset | Services |
+| Frontend service | `frontend/`, Vite; `npm run build`, output `dist` |
+| Backend service | `backend/`, FastAPI; entrypoint `main:app` |
+| Install Command | Automatic per service (`npm ci` for frontend and `pip` from `backend/requirements.txt` for Python) |
+| Environment variables | `GEMINI_API_KEY` (required), `GEMINI_MODEL` (optional; defaults to `gemini-3.5-flash-lite`) |
+
+The root `vercel.json` sends `/api/*` to FastAPI and all other paths to Vite. Do not set a single top-level build command or output directory: each service owns its build. The selected model is a stable Gemini API model listed with a free tier; quotas and availability depend on Google's account and project limits.
+
+## SQL and data boundaries
+
+The browser sends schema names, types, primary-key/nullability metadata, and discovered foreign keys with the user's question. Large schemas are rejected with an explicit size message instead of silently truncating tables. The API uses structured Gemini output, accepts only one SQLite `SELECT` or `WITH ... SELECT`, checks table and column references, rejects mutating and file/extension operations, and adds a 200-row cap. In the browser, SQLite compiles the query against the uploaded database, `PRAGMA query_only` is enabled, and a second outer limit caps results. Unsupported or ambiguous requests return a clarification instead of SQL.
+
+The model may infer relationships from key names when no foreign key is declared, but it cannot confirm business meaning. The app does not send sample or uploaded rows for AI reasoning, so row-value-dependent interpretation (such as inferring undocumented codes) is intentionally limited. Gemini API keys belong only in the backend environment; never place them in frontend variables.
+
+## Checks
+
+Run Python validator/API tests with `python -m unittest discover -s backend/tests`. The Gemini integration test runs only when `GEMINI_API_KEY` is present; otherwise it is reported as skipped. Frontend checks: `cd frontend; npm ci; npm run build`.

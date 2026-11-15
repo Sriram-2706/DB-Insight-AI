@@ -13,6 +13,33 @@ export type TableInfo = { name: string; type: 'table' | 'view'; count: number | 
 export type Schema = TableInfo[]
 export type QueryData = { columns: string[]; rows: Record<string, unknown>[] }
 
+function readOnlyQueryText(sql: string): string {
+  let code = ''
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i]
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch
+      i++
+      for (; i < sql.length; i++) {
+        if (sql[i] === close) {
+          if (close !== ']' && sql[i + 1] === close) { i++; continue }
+          break
+        }
+      }
+      if (i >= sql.length) throw new Error('The generated query contains an unfinished quoted value or identifier.')
+      code += ' '
+      continue
+    }
+    if (sql.startsWith('--', i) || sql.startsWith('/*', i)) throw new Error('SQL comments are not allowed.')
+    if (ch === ';') throw new Error('Only one SQL statement is allowed.')
+    code += ch
+  }
+  if (!/^(SELECT|WITH)\b/i.test(code.trim()) || /\b(insert|update|delete|drop|alter|create|attach|detach|pragma|replace|vacuum|reindex|trigger)\b|\b(load_extension|readfile|writefile|edit|shell|fts3_tokenizer)\s*\(/i.test(code)) {
+    throw new Error('Only a single read-only SELECT query is allowed.')
+  }
+  return code
+}
+
 export function inspect(db: Database): Schema {
   const objects = db.exec("SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name")[0]?.values ?? []
   return objects.map(([rawName, rawType]) => {
@@ -30,9 +57,14 @@ export function inspect(db: Database): Schema {
 
 export function runQuery(db: Database, sql: string): QueryData {
   const normalized = sql.trim()
-  if (!/^SELECT\b/i.test(normalized) || /;|--|\/\*|\b(insert|update|delete|drop|alter|create|attach|detach|pragma|replace|vacuum|reindex|trigger)\b/i.test(normalized)) throw new Error('Only a single read-only SELECT query is allowed.')
-  const limited = /\blimit\s+\d+/i.test(normalized) ? normalized : `${normalized} LIMIT 200`
-  const result = db.exec(limited)[0]
+  readOnlyQueryText(normalized)
+  // Prepare first so SQLite itself checks names and syntax against the loaded file.
+  let statement
+  try { statement = db.prepare(normalized) } catch { throw new Error('The generated query does not match this database schema.') }
+  statement.free()
+  // query_only is set as soon as a database is loaded. The outer limit also caps
+  // a model response that contains a larger or missing inner LIMIT.
+  const result = db.exec(`SELECT * FROM (${normalized}) AS "__dbi_result" LIMIT 200`)[0]
   if (!result) return { columns: [], rows: [] }
   return { columns: result.columns, rows: result.values.map(values => Object.fromEntries(result.columns.map((c, i) => [c, values[i]]))) }
 }
