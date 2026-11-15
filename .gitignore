@@ -1,3 +1,4 @@
+
 # Python virtual environments
 venv/
 .venv/
@@ -8,10 +9,23 @@ backend/venv/
 __pycache__/
 *.py[cod]
 
+# Node dependencies
+node_modules/
+frontend/node_modules/
+
+# Build output
+dist/
+frontend/dist/
+
 # Environment variables
 .env
 .env.*
+!.env.example
 
 # IDE
 .vscode/
 .idea/
+
+# OS files
+.DS_Store
+Thumbs.db
